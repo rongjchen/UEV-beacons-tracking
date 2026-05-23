@@ -1,0 +1,176 @@
+"""Runnable solver converted from MASTERLOOP.m."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import time
+
+import numpy as np
+
+from .io_utils import SerialNoDeviceError, get_config, get_serial
+from .math_utils import unit
+from .model import msm
+
+
+@dataclass
+class SolveResult:
+    rs: np.ndarray
+    p: np.ndarray
+    iterations: int
+    converged: bool
+
+
+def prepare_bmeasure_vector(bmeasure: np.ndarray, focal_length: float = 320.0) -> np.ndarray:
+    """Apply focal length and flatten like MATLAB.
+
+    MATLAB reference:
+        if all(bmeasure(:, 1) == 0), bmeasure(:, 1) = focalLength; end
+        b_unit = unit(bmeasure);
+        b_unit = b_unit';
+        b_unit = b_unit(:);
+
+    For a 6x3 NumPy matrix, row-major flatten gives the same beacon-by-beacon
+    vector order: [b1x,b1y,b1z,b2x,b2y,b2z,...].
+    """
+    bmeasure = np.asarray(bmeasure, dtype=float).copy()
+    if bmeasure.ndim != 2 or bmeasure.shape[1] != 3:
+        raise ValueError("bmeasure must be a matrix with 3 columns")
+
+    if np.all(bmeasure[:, 0] == 0):
+        bmeasure[:, 0] = focal_length
+
+    b_unit = unit(bmeasure)
+    return b_unit.reshape(-1)
+
+
+def has_real_measurements(bmeasure: np.ndarray) -> bool:
+    """Return True when bmeasure has non-zero camera/image-plane data."""
+    bmeasure = np.asarray(bmeasure, dtype=float)
+    return bmeasure.ndim == 2 and bmeasure.shape[1] == 3 and np.any(bmeasure[:, 1:] != 0)
+
+
+def solve_pose(
+    bmeasure: np.ndarray,
+    ri: np.ndarray,
+    guess_rs: np.ndarray | None = None,
+    guess_p: np.ndarray | None = None,
+    weight: np.ndarray | None = None,
+    tolerance: float = 1e-5,
+    max_iters: int = 200,
+    focal_length: float = 320.0,
+) -> SolveResult:
+    """Run the iterative least-squares pose solve."""
+    guess_rs = np.zeros(3, dtype=float) if guess_rs is None else np.asarray(guess_rs, dtype=float).reshape(3)
+    guess_p = np.zeros(3, dtype=float) if guess_p is None else np.asarray(guess_p, dtype=float).reshape(3)
+    ri = np.asarray(ri, dtype=float)
+    n_beacons = ri.shape[0]
+
+    b_unit_vector = prepare_bmeasure_vector(bmeasure, focal_length=focal_length)
+    weight = np.eye(b_unit_vector.size) if weight is None else np.asarray(weight, dtype=float)
+
+    for iteration in range(1, max_iters + 1):
+        if not np.all(np.isfinite(guess_rs)) or not np.all(np.isfinite(guess_p)):
+            return SolveResult(rs=guess_rs, p=guess_p, iterations=iteration, converged=False)
+
+        if np.linalg.norm(guess_rs) > 1e6 or np.linalg.norm(guess_p) > 1e6:
+            return SolveResult(rs=guess_rs, p=guess_p, iterations=iteration, converged=False)
+
+        try:
+            h, deltab = msm(guess_p, guess_rs, b_unit_vector, ri, n_beacons=n_beacons)
+        except OverflowError:
+            return SolveResult(rs=guess_rs, p=guess_p, iterations=iteration, converged=False)
+
+        normal_matrix = h.T @ weight @ h
+        rhs = h.T @ weight @ deltab
+
+        try:
+            deltax = np.linalg.solve(normal_matrix, rhs)
+        except np.linalg.LinAlgError:
+            deltax = np.linalg.lstsq(normal_matrix, rhs, rcond=None)[0]
+
+        if not np.all(np.isfinite(deltax)):
+            return SolveResult(rs=guess_rs, p=guess_p, iterations=iteration, converged=False)
+
+        guess_rs = guess_rs + deltax[:3]
+        guess_p = guess_p + deltax[3:6]
+
+        if np.linalg.norm(deltax) < tolerance:
+            return SolveResult(rs=guess_rs, p=guess_p, iterations=iteration, converged=True)
+
+    return SolveResult(rs=guess_rs, p=guess_p, iterations=max_iters, converged=False)
+
+
+def run_loop(
+    csv_path: str | None = None,
+    use_serial: bool = True,
+    focal_length: float = 320.0,
+    tolerance: float = 1e-5,
+    max_iters: int = 200,
+    once: bool = False,
+    port: str | None = None,
+    baud_rate: int = 115200,
+    min_beacons: int | None = None,
+    serial_timeout: float | None = None,
+    serial_format: str = "raw",
+    image_width: float = 320.0,
+    image_height: float = 240.0,
+    flip_y: bool = True,
+) -> None:
+    """Run the MASTERLOOP-style workflow."""
+    bmeasure, ri = get_config(csv_path)
+
+    if min_beacons is None:
+        min_beacons = ri.shape[0]
+
+    while True:
+        if use_serial:
+            try:
+                bmeasure = get_serial(
+                    port=port,
+                    baud_rate=baud_rate,
+                    rows=ri.shape[0],
+                    min_required=min_beacons,
+                    timeout_seconds=serial_timeout,
+                    serial_format=serial_format,
+                    image_width=image_width,
+                    image_height=image_height,
+                    flip_y=flip_y,
+                )
+            except SerialNoDeviceError as exc:
+                print(exc)
+                if once:
+                    break
+                print("Waiting for a serial device...")
+                time.sleep(1)
+                continue
+            except Exception as exc:
+                print(f"Serial read failed with error: {exc}")
+                if once:
+                    break
+                print("Waiting for better serial data...")
+                time.sleep(1)
+                continue
+        else:
+            if not has_real_measurements(bmeasure):
+                print("No serial input is being used, and the CSV does not contain measurement data.")
+                print("This is only a config file, so the solver will not run.")
+                break
+
+        result = solve_pose(
+            bmeasure=bmeasure,
+            ri=ri,
+            tolerance=tolerance,
+            max_iters=max_iters,
+            focal_length=focal_length,
+        )
+
+        if result.converged:
+            print("Rs:", result.rs)
+            print("p:", result.p)
+        else:
+            print("Solver did not converge with the current measurements.")
+            print("Last Rs:", result.rs)
+            print("Last p:", result.p)
+
+        if once:
+            break

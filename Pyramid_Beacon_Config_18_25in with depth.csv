@@ -1,0 +1,7 @@
+Point_Name,X_m,Y_m,Z_m,X_Ri,Y_Ri,Z_Ri
+VisnavModel3 v2:1 -> beacon1,0,0,0,0.034925,0,0.46355
+VisnavModel3 v2:1 -> beacon2,0,0,0,0.034925,0.401448079,0.231775
+VisnavModel3 v2:1 -> beacon3,0,0,0,0.034925,0.401448079,-0.231775
+VisnavModel3 v2:1 -> beacon4,0,0,0,0.034925,0,-0.46355
+VisnavModel3 v2:1 -> beacon5,0,0,0,0.034925,-0.401448079,-0.231775
+VisnavModel3 v2:1 -> beacon6,0,0,0,0.034925,-0.401448079,0.231775
