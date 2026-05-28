@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from beacon_solver.solver import run_loop
+from solver import run_loop
 
 
 def parse_args() -> argparse.Namespace:
