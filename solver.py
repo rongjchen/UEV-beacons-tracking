@@ -7,9 +7,9 @@ import time
 
 import numpy as np
 
-from .io_utils import SerialNoDeviceError, get_config, get_serial
-from .math_utils import unit
-from .model import msm
+from io_utils import SerialNoDeviceError, get_config, get_serial
+from math_utils import unit
+from model import msm
 
 
 @dataclass
