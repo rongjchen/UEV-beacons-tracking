@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .math_utils import as_col3, dcm, skewp
+from math_utils import as_col3, dcm, skewp
 
 
 def bibguess(p: np.ndarray | list | tuple, rs: np.ndarray | list | tuple, ri: np.ndarray | list | tuple) -> tuple[np.ndarray, np.ndarray]:
