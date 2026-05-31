@@ -51,7 +51,7 @@ def orient_partial(bguess: np.ndarray | list | tuple, p: np.ndarray | list | tup
     return leftside @ rightside
 
 
-def msm(p: np.ndarray | list | tuple, rs: np.ndarray | list | tuple, bmeasure: np.ndarray | list | tuple, ri: np.ndarray | list | tuple, n_beacons: int = 6) -> tuple[np.ndarray, np.ndarray]:
+def msm(p: np.ndarray | list | tuple, rs: np.ndarray | list | tuple, bmeasure: np.ndarray | list | tuple, ri: np.ndarray | list | tuple, n_beacons: int = 4) -> tuple[np.ndarray, np.ndarray]:
     """Build measurement sensitivity matrix H and residual vector deltab."""
     p = as_col3(p)
     rs = as_col3(rs)

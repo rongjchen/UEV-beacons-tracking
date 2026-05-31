@@ -1,4 +1,4 @@
-"""Command-line entry point for the converted MATLAB beacon solver."""
+"""Command-line entry point for the four-beacon solver."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from solver import run_loop
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Converted MATLAB beacon solver")
-    parser.add_argument("--config", help="Path to configuration CSV. If omitted, opens a file picker when available.")
+    parser = argparse.ArgumentParser(description="Four-beacon solver")
+    parser.add_argument("--config", help="Path to 4-beacon configuration CSV. If omitted, opens a file picker when available.")
     parser.add_argument("--no-serial", action="store_true", help="Do not attempt serial input; use the config CSV values only.")
     parser.add_argument("--port", help="Serial port to use, for example COM3. If omitted, uses the first available port.")
     parser.add_argument("--baud-rate", type=int, default=115200, help="Serial baud rate.")
@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pivot-min-distance", type=float, default=0.5, help="Unlabeled mode: minimum distance from pivot to repeated neighbor.")
     parser.add_argument(
         "--pivot-neighbor",
-        choices=["auto-x", "auto-x-inverted", "beacon2", "beacon6"],
+        choices=["auto-x", "auto-x-inverted", "beacon2", "beacon4"],
         default="auto-x",
         help="Unlabeled mode: identify the repeated neighbor around beacon 1. auto-x treats points right of beacon 1 as beacon 2.",
     )
