@@ -111,10 +111,16 @@ def run_loop(
     baud_rate: int = 115200,
     min_beacons: int | None = None,
     serial_timeout: float | None = None,
+    serial_input: str = "unlabeled",
     serial_format: str = "raw",
     image_width: float = 320.0,
     image_height: float = 240.0,
     flip_y: bool = True,
+    stable_samples: int = 3,
+    stable_radius: float = 0.03,
+    pivot_repeat_radius: float = 0.25,
+    pivot_min_distance: float = 0.5,
+    pivot_neighbor: str = "auto-x",
 ) -> None:
     """Run the MASTERLOOP-style workflow."""
     bmeasure, ri = get_config(csv_path)
@@ -131,10 +137,16 @@ def run_loop(
                     rows=ri.shape[0],
                     min_required=min_beacons,
                     timeout_seconds=serial_timeout,
+                    serial_input=serial_input,
                     serial_format=serial_format,
                     image_width=image_width,
                     image_height=image_height,
                     flip_y=flip_y,
+                    stable_samples=stable_samples,
+                    stable_radius=stable_radius,
+                    pivot_repeat_radius=pivot_repeat_radius,
+                    pivot_min_distance=pivot_min_distance,
+                    pivot_neighbor=pivot_neighbor,
                 )
             except SerialNoDeviceError as exc:
                 print(exc)
