@@ -1,4 +1,4 @@
-"""Runnable solver converted from MASTERLOOP.m."""
+"""Runnable four-beacon solver."""
 
 from __future__ import annotations
 
@@ -21,17 +21,7 @@ class SolveResult:
 
 
 def prepare_bmeasure_vector(bmeasure: np.ndarray, focal_length: float = 320.0) -> np.ndarray:
-    """Apply focal length and flatten like MATLAB.
-
-    MATLAB reference:
-        if all(bmeasure(:, 1) == 0), bmeasure(:, 1) = focalLength; end
-        b_unit = unit(bmeasure);
-        b_unit = b_unit';
-        b_unit = b_unit(:);
-
-    For a 6x3 NumPy matrix, row-major flatten gives the same beacon-by-beacon
-    vector order: [b1x,b1y,b1z,b2x,b2y,b2z,...].
-    """
+    """Apply focal length and flatten measurements beacon by beacon."""
     bmeasure = np.asarray(bmeasure, dtype=float).copy()
     if bmeasure.ndim != 2 or bmeasure.shape[1] != 3:
         raise ValueError("bmeasure must be a matrix with 3 columns")
@@ -122,8 +112,11 @@ def run_loop(
     pivot_min_distance: float = 0.5,
     pivot_neighbor: str = "auto-x",
 ) -> None:
-    """Run the MASTERLOOP-style workflow."""
+    """Run the MASTERLOOP-style workflow for four beacons."""
     bmeasure, ri = get_config(csv_path)
+
+    if ri.shape[0] != 4:
+        raise ValueError(f"Four-beacon solver requires exactly 4 CSV rows, got {ri.shape[0]}")
 
     if min_beacons is None:
         min_beacons = ri.shape[0]
