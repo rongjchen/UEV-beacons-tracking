@@ -144,6 +144,9 @@ class UnlabeledBeaconTracker:
         self.recent_stable: list[np.ndarray] = []
         self.synced = False
         self.sequence_index = 0
+        self.release_radius = max(stable_radius * 3.0, 0.1)
+        self.last_stable_point: np.ndarray | None = None
+        self.waiting_for_movement = False
 
     def add_point(self, y_val: float, z_val: float) -> list[tuple[int, float, float]]:
         stable_point = self._stable_point(y_val, z_val)
@@ -159,6 +162,14 @@ class UnlabeledBeaconTracker:
 
     def _stable_point(self, y_val: float, z_val: float) -> np.ndarray | None:
         point = np.array([y_val, z_val], dtype=float)
+
+        if self.waiting_for_movement and self.last_stable_point is not None:
+            if np.linalg.norm(point - self.last_stable_point) <= self.release_radius:
+                self.window.clear()
+                return None
+            self.waiting_for_movement = False
+            self.window.clear()
+
         self.window.append(point)
 
         if len(self.window) > self.stable_samples:
@@ -174,6 +185,8 @@ class UnlabeledBeaconTracker:
             return None
 
         self.window.clear()
+        self.last_stable_point = center
+        self.waiting_for_movement = True
         return center
 
     def _sync_from_pivot(self, stable_point: np.ndarray) -> list[tuple[int, float, float]]:
