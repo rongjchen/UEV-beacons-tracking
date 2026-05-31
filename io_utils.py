@@ -1,16 +1,12 @@
-"""I/O helpers converted from getConfig.m and getSerial.m.
+"""I/O helpers for the six-beacon unlabeled solver.
 
 CSV data and serial data have different meanings:
 - CSV columns 2-4 are optional measurement values from a file.
 - CSV last three columns are real beacon positions Ri = [depth, Y, Z] in meters.
 - Indexed serial lines are OpenMV measurements: beacon_number,y,z.
 - Unlabeled serial lines are OpenMV measurements: y,z. In this mode the code
-  filters stable point clusters and infers beacon rows from the pivot sequence:
+  filters stable point clusters and infers beacon rows from this pivot sequence:
   1,2,3,4,5,6,1,6,5,4,3,2.
-
-By default, serial y,z are treated like the MATLAB reference: they are copied
-straight into bmeasure columns 2 and 3. If your OpenMV sends absolute pixel
-centers, use serial_format="pixel" so the code subtracts the image center first.
 """
 
 from __future__ import annotations
@@ -27,15 +23,7 @@ class SerialNoDeviceError(RuntimeError):
 
 
 def get_config(csv_path: str | Path | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """Load configuration CSV.
-
-    Matches the MATLAB getConfig reference for measurements:
-        bmeasure = columns 2-4, ignoring Point_Name.
-
-    For beacon positions, this uses the last three columns. In your CSV those are
-    the real-world beacon coordinates [depth, Y, Z] in meters, relative to the
-    object center.
-    """
+    """Load a six-beacon configuration CSV."""
     if csv_path is None:
         try:
             from tkinter import Tk, filedialog
@@ -45,7 +33,7 @@ def get_config(csv_path: str | Path | None = None) -> tuple[np.ndarray, np.ndarr
         root = Tk()
         root.withdraw()
         selected = filedialog.askopenfilename(
-            title="Select the Configuration CSV file",
+            title="Select the 6-beacon configuration CSV file",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
         )
         root.destroy()
@@ -58,15 +46,14 @@ def get_config(csv_path: str | Path | None = None) -> tuple[np.ndarray, np.ndarr
 
     if config_data.shape[1] < 7:
         raise ValueError("Configuration CSV must have at least 7 columns")
+    if config_data.shape[0] != 6:
+        raise ValueError(f"Six-beacon configuration must have exactly 6 rows, got {config_data.shape[0]}")
 
-    # MATLAB reference: bmeasure = configData{:, 2:4}
     bmeasure = config_data.iloc[:, 1:4].to_numpy(dtype=float)
-
-    # Your file meaning: last 3 columns are real beacon positions [depth, Y, Z].
     ri = config_data.iloc[:, -3:].to_numpy(dtype=float)
 
     print(f"Successfully loaded configuration from: {csv_path.name}")
-    print(f"Loaded {ri.shape[0]} beacon positions from last three CSV columns.")
+    print("Loaded 6 beacon positions from last three CSV columns.")
     return bmeasure, ri
 
 
@@ -81,10 +68,7 @@ def list_serial_ports() -> list[str]:
 
 
 def parse_sensor_line(raw_data: str, rows: int) -> tuple[int, float, float] | None:
-    """Parse one sensor line: beacon_number,y,z.
-
-    Example: "1,36,32" returns row index 0 and values 36, 32.
-    """
+    """Parse one indexed sensor line: beacon_number,y,z."""
     raw_data = raw_data.strip()
     if not raw_data:
         return None
@@ -131,15 +115,7 @@ def parse_unlabeled_sensor_line(raw_data: str) -> tuple[float, float] | None:
 
 
 class UnlabeledBeaconTracker:
-    """Convert a fast unlabeled y,z stream into labeled beacon measurements.
-
-    The physical flash pattern must pivot on beacon 1:
-        1,2,3,4,5,6,1,6,5,4,3,2
-
-    Before sync, the tracker accepts only stable clusters and searches for an
-    A,B,A pattern. The middle point B is beacon 1. After sync, each stable
-    cluster is assigned to the next expected beacon in the pivot sequence.
-    """
+    """Convert a fast unlabeled y,z stream into six labeled beacon rows."""
 
     sequence = [0, 1, 2, 3, 4, 5, 0, 5, 4, 3, 2, 1]
 
@@ -153,7 +129,7 @@ class UnlabeledBeaconTracker:
         pivot_neighbor: str = "auto-x",
     ) -> None:
         if rows != 6:
-            raise ValueError("Unlabeled pivot tracking currently requires exactly 6 beacons")
+            raise ValueError("Six-beacon unlabeled tracking requires exactly 6 beacons")
         if stable_samples < 2:
             raise ValueError("stable_samples must be at least 2")
         if pivot_neighbor not in {"auto-x", "auto-x-inverted", "beacon2", "beacon6"}:
@@ -168,6 +144,9 @@ class UnlabeledBeaconTracker:
         self.recent_stable: list[np.ndarray] = []
         self.synced = False
         self.sequence_index = 0
+        self.release_radius = max(stable_radius * 3.0, 0.1)
+        self.last_stable_point: np.ndarray | None = None
+        self.waiting_for_movement = False
 
     def add_point(self, y_val: float, z_val: float) -> list[tuple[int, float, float]]:
         stable_point = self._stable_point(y_val, z_val)
@@ -183,6 +162,14 @@ class UnlabeledBeaconTracker:
 
     def _stable_point(self, y_val: float, z_val: float) -> np.ndarray | None:
         point = np.array([y_val, z_val], dtype=float)
+
+        if self.waiting_for_movement and self.last_stable_point is not None:
+            if np.linalg.norm(point - self.last_stable_point) <= self.release_radius:
+                self.window.clear()
+                return None
+            self.waiting_for_movement = False
+            self.window.clear()
+
         self.window.append(point)
 
         if len(self.window) > self.stable_samples:
@@ -198,6 +185,8 @@ class UnlabeledBeaconTracker:
             return None
 
         self.window.clear()
+        self.last_stable_point = center
+        self.waiting_for_movement = True
         return center
 
     def _sync_from_pivot(self, stable_point: np.ndarray) -> list[tuple[int, float, float]]:
@@ -229,15 +218,13 @@ class UnlabeledBeaconTracker:
         if neighbor_index == 1:
             # Saw 2,1,2. The next stable point should be beacon 3.
             self.sequence_index = 2
-            neighbor_name = "beacon 2"
         else:
             # Saw 6,1,6. The next stable point should be beacon 5.
             self.sequence_index = 8
-            neighbor_name = "beacon 6"
 
         self.synced = True
         self.recent_stable.clear()
-        print(f"Pivot sync found: beacon 1 plus repeated {neighbor_name}.")
+        print(f"Pivot sync found: beacon 1 plus repeated beacon {neighbor_index + 1}.")
 
         return [
             (0, pivot[0], pivot[1]),
@@ -252,8 +239,8 @@ class UnlabeledBeaconTracker:
         if self.pivot_neighbor == "auto-x-inverted":
             return 5 if repeated[0] >= pivot[0] else 1
 
-        # Default camera convention for your sample stream: beacon 2 is to the
-        # right of beacon 1, and beacon 6 is to the left.
+        # Default camera convention: beacon 2 is right of beacon 1, and
+        # beacon 6 is left of beacon 1.
         return 1 if repeated[0] >= pivot[0] else 5
 
 
@@ -274,35 +261,18 @@ def get_serial(
     pivot_min_distance: float = 0.5,
     pivot_neighbor: str = "auto-x",
 ) -> np.ndarray:
-    """Read serial measurements until enough unique beacon rows are received.
-
-    Indexed line format from OpenMV:
-        beacon_number,y,z
-
-    Unlabeled line format from OpenMV:
-        y,z
-
-    serial_format="raw" matches the MATLAB reference exactly:
-        bmeasure[row, 1] = y
-        bmeasure[row, 2] = z
-
-    serial_format="pixel" is for absolute OpenMV pixel centers:
-        y becomes pixel_x - image_width/2
-        z becomes image_height/2 - pixel_y when flip_y=True
-
-    The first column remains zero here. The solver fills it with focal length,
-    just like MASTERLOOP.m.
-    """
+    """Read serial measurements until enough unique beacon rows are received."""
     try:
         import serial
     except ImportError as exc:
         raise ImportError("pyserial is required for serial input. Install it with: pip install pyserial") from exc
 
+    if rows != 6:
+        raise ValueError("Six-beacon serial input requires rows=6")
     if min_required is None:
         min_required = rows
     if min_required < 1 or min_required > rows:
         raise ValueError("min_required must be between 1 and rows")
-
     if serial_format not in {"raw", "pixel"}:
         raise ValueError('serial_format must be either "raw" or "pixel"')
     if serial_input not in {"indexed", "unlabeled"}:
@@ -321,6 +291,7 @@ def get_serial(
         print('Expected format: "beacon_number,y,z", for example: "1,36,32"')
     else:
         print('Expected format: "y,z", for example: "0.0664,-6.9448"')
+        print("Pivot sequence: 1,2,3,4,5,6,1,6,5,4,3,2")
         print(
             "Unlabeled filter: "
             f"{stable_samples} samples within {stable_radius} radius; "
@@ -379,7 +350,6 @@ def get_serial(
                     y_measure = y_val
                     z_measure = z_val
 
-                # Match MATLAB getSerial: column 0 stays zero; columns 1 and 2 get measurements.
                 bmeasure[row_index, 1] = y_measure
                 bmeasure[row_index, 2] = z_measure
                 received[row_index] = True
