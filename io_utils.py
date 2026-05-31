@@ -3,7 +3,10 @@
 CSV data and serial data have different meanings:
 - CSV columns 2-4 are optional measurement values from a file.
 - CSV last three columns are real beacon positions Ri = [depth, Y, Z] in meters.
-- Serial lines are OpenMV measurements: beacon_number,y,z.
+- Indexed serial lines are OpenMV measurements: beacon_number,y,z.
+- Unlabeled serial lines are OpenMV measurements: y,z. In this mode the code
+  filters stable point clusters and infers beacon rows from the pivot sequence:
+  1,2,3,4,5,6,1,6,5,4,3,2.
 
 By default, serial y,z are treated like the MATLAB reference: they are copied
 straight into bmeasure columns 2 and 3. If your OpenMV sends absolute pixel
@@ -106,21 +109,178 @@ def parse_sensor_line(raw_data: str, rows: int) -> tuple[int, float, float] | No
     return beacon_number - 1, y_val, z_val
 
 
+def parse_unlabeled_sensor_line(raw_data: str) -> tuple[float, float] | None:
+    """Parse one unlabeled sensor line: y,z."""
+    raw_data = raw_data.strip()
+    if not raw_data:
+        return None
+
+    parts = raw_data.split(",")
+    if len(parts) != 2:
+        print(f"Serial warning: ignored invalid unlabeled line: {raw_data!r}")
+        return None
+
+    try:
+        y_val = float(parts[0])
+        z_val = float(parts[1])
+    except ValueError:
+        print(f"Serial warning: ignored non-numeric unlabeled line: {raw_data!r}")
+        return None
+
+    return y_val, z_val
+
+
+class UnlabeledBeaconTracker:
+    """Convert a fast unlabeled y,z stream into labeled beacon measurements.
+
+    The physical flash pattern must pivot on beacon 1:
+        1,2,3,4,5,6,1,6,5,4,3,2
+
+    Before sync, the tracker accepts only stable clusters and searches for an
+    A,B,A pattern. The middle point B is beacon 1. After sync, each stable
+    cluster is assigned to the next expected beacon in the pivot sequence.
+    """
+
+    sequence = [0, 1, 2, 3, 4, 5, 0, 5, 4, 3, 2, 1]
+
+    def __init__(
+        self,
+        rows: int,
+        stable_samples: int = 3,
+        stable_radius: float = 0.03,
+        pivot_repeat_radius: float = 0.25,
+        pivot_min_distance: float = 0.5,
+        pivot_neighbor: str = "auto-x",
+    ) -> None:
+        if rows != 6:
+            raise ValueError("Unlabeled pivot tracking currently requires exactly 6 beacons")
+        if stable_samples < 2:
+            raise ValueError("stable_samples must be at least 2")
+        if pivot_neighbor not in {"auto-x", "auto-x-inverted", "beacon2", "beacon6"}:
+            raise ValueError('pivot_neighbor must be "auto-x", "auto-x-inverted", "beacon2", or "beacon6"')
+
+        self.stable_samples = stable_samples
+        self.stable_radius = stable_radius
+        self.pivot_repeat_radius = pivot_repeat_radius
+        self.pivot_min_distance = pivot_min_distance
+        self.pivot_neighbor = pivot_neighbor
+        self.window: list[np.ndarray] = []
+        self.recent_stable: list[np.ndarray] = []
+        self.synced = False
+        self.sequence_index = 0
+
+    def add_point(self, y_val: float, z_val: float) -> list[tuple[int, float, float]]:
+        stable_point = self._stable_point(y_val, z_val)
+        if stable_point is None:
+            return []
+
+        if self.synced:
+            row_index = self.sequence[self.sequence_index]
+            self.sequence_index = (self.sequence_index + 1) % len(self.sequence)
+            return [(row_index, stable_point[0], stable_point[1])]
+
+        return self._sync_from_pivot(stable_point)
+
+    def _stable_point(self, y_val: float, z_val: float) -> np.ndarray | None:
+        point = np.array([y_val, z_val], dtype=float)
+        self.window.append(point)
+
+        if len(self.window) > self.stable_samples:
+            self.window.pop(0)
+        if len(self.window) < self.stable_samples:
+            return None
+
+        points = np.vstack(self.window)
+        center = np.mean(points, axis=0)
+        distances = np.linalg.norm(points - center, axis=1)
+
+        if float(np.max(distances)) > self.stable_radius:
+            return None
+
+        self.window.clear()
+        return center
+
+    def _sync_from_pivot(self, stable_point: np.ndarray) -> list[tuple[int, float, float]]:
+        self.recent_stable.append(stable_point)
+        if len(self.recent_stable) > 3:
+            self.recent_stable.pop(0)
+        if len(self.recent_stable) < 3:
+            print(f"Stable point found while syncing: ({stable_point[0]:.4f}, {stable_point[1]:.4f})")
+            return []
+
+        repeated_before, pivot, repeated_after = self.recent_stable
+        repeat_distance = np.linalg.norm(repeated_before - repeated_after)
+        pivot_distance = min(
+            np.linalg.norm(repeated_before - pivot),
+            np.linalg.norm(repeated_after - pivot),
+        )
+
+        print(
+            "Stable point found while syncing: "
+            f"({stable_point[0]:.4f}, {stable_point[1]:.4f}); "
+            f"pivot check repeat={repeat_distance:.4f}, pivot_dist={pivot_distance:.4f}"
+        )
+
+        if repeat_distance > self.pivot_repeat_radius or pivot_distance < self.pivot_min_distance:
+            return []
+
+        neighbor_index = self._infer_repeated_neighbor(pivot, repeated_after)
+
+        if neighbor_index == 1:
+            # Saw 2,1,2. The next stable point should be beacon 3.
+            self.sequence_index = 2
+            neighbor_name = "beacon 2"
+        else:
+            # Saw 6,1,6. The next stable point should be beacon 5.
+            self.sequence_index = 8
+            neighbor_name = "beacon 6"
+
+        self.synced = True
+        self.recent_stable.clear()
+        print(f"Pivot sync found: beacon 1 plus repeated {neighbor_name}.")
+
+        return [
+            (0, pivot[0], pivot[1]),
+            (neighbor_index, repeated_after[0], repeated_after[1]),
+        ]
+
+    def _infer_repeated_neighbor(self, pivot: np.ndarray, repeated: np.ndarray) -> int:
+        if self.pivot_neighbor == "beacon2":
+            return 1
+        if self.pivot_neighbor == "beacon6":
+            return 5
+        if self.pivot_neighbor == "auto-x-inverted":
+            return 5 if repeated[0] >= pivot[0] else 1
+
+        # Default camera convention for your sample stream: beacon 2 is to the
+        # right of beacon 1, and beacon 6 is to the left.
+        return 1 if repeated[0] >= pivot[0] else 5
+
+
 def get_serial(
     port: str | None = None,
     baud_rate: int = 115200,
     rows: int = 6,
     min_required: int | None = None,
     timeout_seconds: float | None = None,
+    serial_input: str = "unlabeled",
     serial_format: str = "raw",
     image_width: float = 320.0,
     image_height: float = 240.0,
     flip_y: bool = True,
+    stable_samples: int = 3,
+    stable_radius: float = 0.03,
+    pivot_repeat_radius: float = 0.25,
+    pivot_min_distance: float = 0.5,
+    pivot_neighbor: str = "auto-x",
 ) -> np.ndarray:
     """Read serial measurements until enough unique beacon rows are received.
 
-    Expected line format from OpenMV:
+    Indexed line format from OpenMV:
         beacon_number,y,z
+
+    Unlabeled line format from OpenMV:
+        y,z
 
     serial_format="raw" matches the MATLAB reference exactly:
         bmeasure[row, 1] = y
@@ -145,6 +305,8 @@ def get_serial(
 
     if serial_format not in {"raw", "pixel"}:
         raise ValueError('serial_format must be either "raw" or "pixel"')
+    if serial_input not in {"indexed", "unlabeled"}:
+        raise ValueError('serial_input must be either "indexed" or "unlabeled"')
 
     if port is None:
         available_ports = list_serial_ports()
@@ -155,12 +317,32 @@ def get_serial(
 
     print(f"Connecting to device on {port} at {baud_rate} baud...")
     print(f"Waiting for {min_required} unique beacon measurement(s)...")
-    print('Expected format: "beacon_number,y,z", for example: "1,36,32"')
+    if serial_input == "indexed":
+        print('Expected format: "beacon_number,y,z", for example: "1,36,32"')
+    else:
+        print('Expected format: "y,z", for example: "0.0664,-6.9448"')
+        print(
+            "Unlabeled filter: "
+            f"{stable_samples} samples within {stable_radius} radius; "
+            f"pivot repeat radius {pivot_repeat_radius}"
+        )
     print(f"Serial format: {serial_format}")
 
     bmeasure = np.zeros((rows, 3), dtype=float)
     received = np.zeros(rows, dtype=bool)
     start_time = time.time()
+    tracker = (
+        UnlabeledBeaconTracker(
+            rows=rows,
+            stable_samples=stable_samples,
+            stable_radius=stable_radius,
+            pivot_repeat_radius=pivot_repeat_radius,
+            pivot_min_distance=pivot_min_distance,
+            pivot_neighbor=pivot_neighbor,
+        )
+        if serial_input == "unlabeled"
+        else None
+    )
 
     with serial.Serial(port, baud_rate, timeout=1) as open_mv:
         while np.count_nonzero(received) < min_required:
@@ -171,31 +353,42 @@ def get_serial(
                 )
 
             raw_data = open_mv.readline().decode("utf-8", errors="replace").strip()
-            parsed = parse_sensor_line(raw_data, rows)
-            if parsed is None:
-                continue
+            if serial_input == "indexed":
+                parsed = parse_sensor_line(raw_data, rows)
+                if parsed is None:
+                    continue
 
-            row_index, y_val, z_val = parsed
-
-            if serial_format == "pixel":
-                pixel_x = y_val
-                pixel_y = z_val
-                y_measure = pixel_x - image_width / 2.0
-                z_measure = image_height / 2.0 - pixel_y if flip_y else pixel_y - image_height / 2.0
+                row_index, y_val, z_val = parsed
+                accepted = [(row_index, y_val, z_val)]
             else:
-                y_measure = y_val
-                z_measure = z_val
+                parsed_unlabeled = parse_unlabeled_sensor_line(raw_data)
+                if parsed_unlabeled is None:
+                    continue
 
-            # Match MATLAB getSerial: column 0 stays zero; columns 1 and 2 get measurements.
-            bmeasure[row_index, 1] = y_measure
-            bmeasure[row_index, 2] = z_measure
-            received[row_index] = True
+                y_val, z_val = parsed_unlabeled
+                assert tracker is not None
+                accepted = tracker.add_point(y_val, z_val)
 
-            print(
-                f"Beacon {row_index + 1}: raw=({y_val}, {z_val}), "
-                f"measurement=({y_measure}, {z_measure}) "
-                f"[{np.count_nonzero(received)}/{min_required}]"
-            )
+            for row_index, y_val, z_val in accepted:
+                if serial_format == "pixel":
+                    pixel_x = y_val
+                    pixel_y = z_val
+                    y_measure = pixel_x - image_width / 2.0
+                    z_measure = image_height / 2.0 - pixel_y if flip_y else pixel_y - image_height / 2.0
+                else:
+                    y_measure = y_val
+                    z_measure = z_val
+
+                # Match MATLAB getSerial: column 0 stays zero; columns 1 and 2 get measurements.
+                bmeasure[row_index, 1] = y_measure
+                bmeasure[row_index, 2] = z_measure
+                received[row_index] = True
+
+                print(
+                    f"Beacon {row_index + 1}: raw=({y_val}, {z_val}), "
+                    f"measurement=({y_measure}, {z_measure}) "
+                    f"[{np.count_nonzero(received)}/{min_required}]"
+                )
 
     print("Matrix bmeasure successfully populated.")
     return bmeasure
