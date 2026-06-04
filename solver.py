@@ -8,7 +8,7 @@ import time
 import numpy as np
 
 from io_utils import SerialNoDeviceError, get_config, get_serial
-from math_utils import unit
+from math_utils import dcm, unit
 from model import msm
 
 
@@ -37,6 +37,17 @@ def has_real_measurements(bmeasure: np.ndarray) -> bool:
     """Return True when bmeasure has non-zero camera/image-plane data."""
     bmeasure = np.asarray(bmeasure, dtype=float)
     return bmeasure.ndim == 2 and bmeasure.shape[1] == 3 and np.any(bmeasure[:, 1:] != 0)
+
+
+def print_pose_details(result: SolveResult) -> None:
+    """Print pose plus derived values that are easier to compare to a tape measure."""
+    distance_m = float(np.linalg.norm(result.rs))
+    object_center_camera_frame = dcm(result.p) @ (-result.rs)
+
+    print("Rs:", result.rs)
+    print("p:", result.p)
+    print(f"distance: {distance_m:.4f} m ({distance_m * 3.28084:.2f} ft)")
+    print("object center in camera frame:", object_center_camera_frame)
 
 
 def solve_pose(
@@ -99,10 +110,15 @@ def run_loop(
     once: bool = False,
     port: str | None = None,
     baud_rate: int = 115200,
+    replay_file: str | None = None,
     min_beacons: int | None = None,
     serial_timeout: float | None = None,
     serial_input: str = "unlabeled",
     serial_format: str = "raw",
+    unlabeled_method: str = "quadrant",
+    cluster_samples: int = 300,
+    corner_fraction: float = 0.25,
+    quadrant_order: str = "TR,BR,BL,TL",
     image_width: float = 320.0,
     image_height: float = 240.0,
     flip_y: bool = True,
@@ -127,11 +143,16 @@ def run_loop(
                 bmeasure = get_serial(
                     port=port,
                     baud_rate=baud_rate,
+                    replay_file=replay_file,
                     rows=ri.shape[0],
                     min_required=min_beacons,
                     timeout_seconds=serial_timeout,
                     serial_input=serial_input,
                     serial_format=serial_format,
+                    unlabeled_method=unlabeled_method,
+                    cluster_samples=cluster_samples,
+                    corner_fraction=corner_fraction,
+                    quadrant_order=quadrant_order,
                     image_width=image_width,
                     image_height=image_height,
                     flip_y=flip_y,
@@ -170,8 +191,7 @@ def run_loop(
         )
 
         if result.converged:
-            print("Rs:", result.rs)
-            print("p:", result.p)
+            print_pose_details(result)
         else:
             print("Solver did not converge with the current measurements.")
             print("Last Rs:", result.rs)
