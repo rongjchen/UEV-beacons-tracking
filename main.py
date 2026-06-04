@@ -13,6 +13,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-serial", action="store_true", help="Do not attempt serial input; use the config CSV values only.")
     parser.add_argument("--port", help="Serial port to use, for example COM3. If omitted, uses the first available port.")
     parser.add_argument("--baud-rate", type=int, default=115200, help="Serial baud rate.")
+    parser.add_argument("--replay-file", help="Read serial-style x,y lines from a local text file instead of a COM port.")
     parser.add_argument("--min-beacons", type=int, help="Number of unique beacon measurements required before solving. Default: all beacons.")
     parser.add_argument("--serial-timeout", type=float, help="Seconds to wait for serial data before failing. Default: wait forever.")
     parser.add_argument(
@@ -26,6 +27,19 @@ def parse_args() -> argparse.Namespace:
         choices=["raw", "pixel"],
         default="raw",
         help="raw: use y,z directly like MATLAB. pixel: convert absolute pixel centers to camera-centered offsets.",
+    )
+    parser.add_argument(
+        "--unlabeled-method",
+        choices=["quadrant", "pivot"],
+        default="quadrant",
+        help="quadrant: batch cluster four PSD corners. pivot: use streaming pivot sequence tracker.",
+    )
+    parser.add_argument("--cluster-samples", type=int, default=100, help="Quadrant mode: serial samples to collect before assigning beacons.")
+    parser.add_argument("--corner-fraction", type=float, default=0.25, help="Quadrant mode: fraction of each quadrant nearest the corner to average.")
+    parser.add_argument(
+        "--quadrant-order",
+        default="TR,BR,BL,TL",
+        help="Quadrant mode: quadrant labels for beacon 1..4. Default maps B1=TR, B2=BR, B3=BL, B4=TL.",
     )
     parser.add_argument("--image-width", type=float, default=320.0, help="OpenMV image width in pixels, used only with --serial-format pixel.")
     parser.add_argument("--image-height", type=float, default=240.0, help="OpenMV image height in pixels, used only with --serial-format pixel.")
@@ -58,10 +72,15 @@ def main() -> None:
         once=args.once,
         port=args.port,
         baud_rate=args.baud_rate,
+        replay_file=args.replay_file,
         min_beacons=args.min_beacons,
         serial_timeout=args.serial_timeout,
         serial_input=args.serial_input,
         serial_format=args.serial_format,
+        unlabeled_method=args.unlabeled_method,
+        cluster_samples=args.cluster_samples,
+        corner_fraction=args.corner_fraction,
+        quadrant_order=args.quadrant_order,
         image_width=args.image_width,
         image_height=args.image_height,
         flip_y=not args.no_flip_y,
