@@ -22,6 +22,34 @@ class SerialNoDeviceError(RuntimeError):
     """Raised when no serial device is available."""
 
 
+class ReplayInput:
+    """Serial-like reader for replaying local text files."""
+
+    def __init__(self, replay_file: str | Path) -> None:
+        self.replay_file = Path(replay_file)
+        self.file = None
+
+    def __enter__(self) -> "ReplayInput":
+        self.file = self.replay_file.open("rb")
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if self.file is not None:
+            self.file.close()
+
+    def readline(self) -> bytes:
+        if self.file is None:
+            return b""
+
+        line = self.file.readline()
+        if line:
+            return line
+
+        # Loop the replay file so continuous mode can keep running.
+        self.file.seek(0)
+        return self.file.readline()
+
+
 def get_config(csv_path: str | Path | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Load a four-beacon configuration CSV."""
     if csv_path is None:
@@ -112,6 +140,82 @@ def parse_unlabeled_sensor_line(raw_data: str) -> tuple[float, float] | None:
         return None
 
     return y_val, z_val
+
+
+def parse_quadrant_order(quadrant_order: str) -> list[str]:
+    """Return quadrant labels for beacon rows 1..4."""
+    labels = [part.strip().upper() for part in quadrant_order.replace(";", ",").split(",") if part.strip()]
+    valid = {"TR", "BR", "BL", "TL"}
+    if len(labels) != 4 or set(labels) != valid:
+        raise ValueError('quadrant_order must contain TR,BR,BL,TL exactly once, for example "TR,BR,BL,TL"')
+    return labels
+
+
+def assign_quadrant_beacons(
+    points: list[tuple[float, float]],
+    corner_fraction: float = 0.25,
+    quadrant_order: str = "TR,BR,BL,TL",
+    min_points_per_quadrant: int = 5,
+) -> list[tuple[int, float, float]]:
+    """Estimate four beacon corners from a batch of unlabeled PSD points.
+
+    For the real 11-ft PSD stream, transition samples lie mostly on the edges
+    between four dense corner regions. This method splits the batch into image
+    quadrants, then uses only the samples nearest each extreme corner so edge
+    transitions do not pull the beacon center away from the true stop.
+    """
+    if not 0.0 < corner_fraction <= 1.0:
+        raise ValueError("corner_fraction must be greater than 0 and at most 1")
+
+    arr = np.asarray(points, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        raise ValueError("points must be a list of y,z pairs")
+    if arr.shape[0] < 4 * min_points_per_quadrant:
+        raise ValueError("Not enough points for quadrant assignment")
+
+    x_values = arr[:, 0]
+    y_values = arr[:, 1]
+    low_x, high_x = np.percentile(x_values, [5, 95])
+    low_y, high_y = np.percentile(y_values, [5, 95])
+    mid_x = (low_x + high_x) / 2.0
+    mid_y = (low_y + high_y) / 2.0
+
+    masks = {
+        "TR": (x_values >= mid_x) & (y_values >= mid_y),
+        "BR": (x_values >= mid_x) & (y_values < mid_y),
+        "BL": (x_values < mid_x) & (y_values < mid_y),
+        "TL": (x_values < mid_x) & (y_values >= mid_y),
+    }
+    ideal_corners = {
+        "TR": np.array([high_x, high_y], dtype=float),
+        "BR": np.array([high_x, low_y], dtype=float),
+        "BL": np.array([low_x, low_y], dtype=float),
+        "TL": np.array([low_x, high_y], dtype=float),
+    }
+
+    centers: dict[str, np.ndarray] = {}
+    for label, mask in masks.items():
+        quadrant_points = arr[mask]
+        if quadrant_points.shape[0] < min_points_per_quadrant:
+            raise ValueError(
+                f"Not enough points in {label} quadrant. "
+                f"Got {quadrant_points.shape[0]}, need at least {min_points_per_quadrant}."
+            )
+
+        distances = np.linalg.norm(quadrant_points - ideal_corners[label], axis=1)
+        keep_count = max(min_points_per_quadrant, int(np.ceil(quadrant_points.shape[0] * corner_fraction)))
+        keep_count = min(keep_count, quadrant_points.shape[0])
+        closest = quadrant_points[np.argsort(distances)[:keep_count]]
+        centers[label] = np.median(closest, axis=0)
+
+    ordered_labels = parse_quadrant_order(quadrant_order)
+    print(
+        "Quadrant centers: "
+        + ", ".join(f"{label}=({centers[label][0]:.4f}, {centers[label][1]:.4f})" for label in ["TR", "BR", "BL", "TL"])
+    )
+    print("Quadrant assignment: " + ", ".join(f"Beacon {i + 1}={label}" for i, label in enumerate(ordered_labels)))
+
+    return [(row_index, centers[label][0], centers[label][1]) for row_index, label in enumerate(ordered_labels)]
 
 
 class UnlabeledBeaconTracker:
@@ -247,11 +351,16 @@ class UnlabeledBeaconTracker:
 def get_serial(
     port: str | None = None,
     baud_rate: int = 115200,
+    replay_file: str | Path | None = None,
     rows: int = 4,
     min_required: int | None = None,
     timeout_seconds: float | None = None,
     serial_input: str = "unlabeled",
     serial_format: str = "raw",
+    unlabeled_method: str = "quadrant",
+    cluster_samples: int = 300,
+    corner_fraction: float = 0.25,
+    quadrant_order: str = "TR,BR,BL,TL",
     image_width: float = 320.0,
     image_height: float = 240.0,
     flip_y: bool = True,
@@ -262,11 +371,6 @@ def get_serial(
     pivot_neighbor: str = "auto-x",
 ) -> np.ndarray:
     """Read serial measurements until enough unique beacon rows are received."""
-    try:
-        import serial
-    except ImportError as exc:
-        raise ImportError("pyserial is required for serial input. Install it with: pip install pyserial") from exc
-
     if rows != 4:
         raise ValueError("Four-beacon serial input requires rows=4")
     if min_required is None:
@@ -277,26 +381,49 @@ def get_serial(
         raise ValueError('serial_format must be either "raw" or "pixel"')
     if serial_input not in {"indexed", "unlabeled"}:
         raise ValueError('serial_input must be either "indexed" or "unlabeled"')
+    if unlabeled_method not in {"quadrant", "pivot"}:
+        raise ValueError('unlabeled_method must be either "quadrant" or "pivot"')
+    if cluster_samples < 4:
+        raise ValueError("cluster_samples must be at least 4")
+    parse_quadrant_order(quadrant_order)
 
-    if port is None:
+    if replay_file is None:
+        try:
+            import serial
+        except ImportError as exc:
+            raise ImportError("pyserial is required for serial input. Install it with: pip install pyserial") from exc
+    else:
+        serial = None
+        replay_path = Path(replay_file)
+        if not replay_path.exists():
+            raise FileNotFoundError(f"Replay file not found: {replay_path}")
+
+    if replay_file is None and port is None:
         available_ports = list_serial_ports()
         if not available_ports:
             raise SerialNoDeviceError("No serial connections detected. Looking for file instead.")
         port = available_ports[0]
         print(f"Available serial ports: {available_ports}")
 
-    print(f"Connecting to device on {port} at {baud_rate} baud...")
+    if replay_file is None:
+        print(f"Connecting to device on {port} at {baud_rate} baud...")
+    else:
+        print(f"Replaying serial data from: {Path(replay_file)}")
     print(f"Waiting for {min_required} unique beacon measurement(s)...")
     if serial_input == "indexed":
         print('Expected format: "beacon_number,y,z", for example: "1,36,32"')
     else:
         print('Expected format: "y,z", for example: "0.0000,-6.5000"')
-        print("Pivot sequence: 1,2,3,4,1,4,3,2")
-        print(
-            "Unlabeled filter: "
-            f"{stable_samples} samples within {stable_radius} radius; "
-            f"pivot repeat radius {pivot_repeat_radius}"
-        )
+        print(f"Unlabeled method: {unlabeled_method}")
+        if unlabeled_method == "quadrant":
+            print(f"Quadrant mode: collecting {cluster_samples} samples before assignment.")
+        else:
+            print("Pivot sequence: 1,2,3,4,1,4,3,2")
+            print(
+                "Unlabeled filter: "
+                f"{stable_samples} samples within {stable_radius} radius; "
+                f"pivot repeat radius {pivot_repeat_radius}"
+            )
     print(f"Serial format: {serial_format}")
 
     bmeasure = np.zeros((rows, 3), dtype=float)
@@ -311,11 +438,56 @@ def get_serial(
             pivot_min_distance=pivot_min_distance,
             pivot_neighbor=pivot_neighbor,
         )
-        if serial_input == "unlabeled"
+        if serial_input == "unlabeled" and unlabeled_method == "pivot"
         else None
     )
 
-    with serial.Serial(port, baud_rate, timeout=1) as open_mv:
+    input_source = ReplayInput(replay_file) if replay_file is not None else serial.Serial(port, baud_rate, timeout=1)
+
+    with input_source as open_mv:
+        if serial_input == "unlabeled" and unlabeled_method == "quadrant":
+            raw_points: list[tuple[float, float]] = []
+            while len(raw_points) < cluster_samples:
+                if timeout_seconds is not None and time.time() - start_time > timeout_seconds:
+                    raise TimeoutError(
+                        f"Timed out waiting for serial data. "
+                        f"Collected {len(raw_points)} of {cluster_samples} samples."
+                    )
+
+                raw_data = open_mv.readline().decode("utf-8", errors="replace").strip()
+                parsed_unlabeled = parse_unlabeled_sensor_line(raw_data)
+                if parsed_unlabeled is None:
+                    continue
+                raw_points.append(parsed_unlabeled)
+
+            accepted = assign_quadrant_beacons(
+                raw_points,
+                corner_fraction=corner_fraction,
+                quadrant_order=quadrant_order,
+            )
+
+            for row_index, y_val, z_val in accepted:
+                if serial_format == "pixel":
+                    pixel_x = y_val
+                    pixel_y = z_val
+                    y_measure = pixel_x - image_width / 2.0
+                    z_measure = image_height / 2.0 - pixel_y if flip_y else pixel_y - image_height / 2.0
+                else:
+                    y_measure = y_val
+                    z_measure = z_val
+
+                bmeasure[row_index, 1] = y_measure
+                bmeasure[row_index, 2] = z_measure
+                received[row_index] = True
+                print(
+                    f"Beacon {row_index + 1}: raw=({y_val}, {z_val}), "
+                    f"measurement=({y_measure}, {z_measure}) "
+                    f"[{np.count_nonzero(received)}/{min_required}]"
+                )
+
+            print("Matrix bmeasure successfully populated.")
+            return bmeasure
+
         while np.count_nonzero(received) < min_required:
             if timeout_seconds is not None and time.time() - start_time > timeout_seconds:
                 raise TimeoutError(
